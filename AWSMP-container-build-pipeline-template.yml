@@ -1,0 +1,264 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: CFN Template to deploy CodePipeline to build Docker Image and push to AWS MArketplace ECR. **WARNING** This template creates Amazon S3 bucket, AWS CodePipeline, AWS CodeBuild and related resources. You will be billed for the AWS resources used if you create a stack from this template
+
+Parameters:
+
+  SourceRepoName:
+    Type: String
+    Description: AWS CodeCommit source repository for your Docker image - must contain a Dockerfile in the base
+    Default: awsmp-demo-repo
+    MinLength: 1
+    MaxLength: 100
+    ConstraintDescription: You must enter a CodeCommit repository name
+
+  BranchName:
+    Type: String
+    Default: master
+    Description: AWS CodeCommit git repository branch - change triggers a new build
+    MinLength: 1
+    MaxLength: 100
+    ConstraintDescription: You must enter a CodeCommit repository branch name
+
+  EcrDockerRepository:
+    Type: String
+    Default: hbs-huex-devops
+    Description: The Amazon ECR repository name you created on AWS Marketplace Management Portal. The format should be <seller-displayname>/<repo-name>
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: CodeCommit
+        Parameters:
+          - SourceRepoName
+          - BranchName
+    ParameterLabels:
+      SourceRepoName:
+        default: Repository
+      BranchName:
+        default: Branch
+
+Resources:
+  CodePipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+      LoggingConfiguration:
+          DestinationBucketName: !Ref LoggingBucket
+          LogFilePrefix: example-logs 
+  LoggingBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      AccessControl: LogDeliveryWrite
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+
+  CodePipelineArtifactBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref CodePipelineArtifactBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Join 
+              - ''
+              - - !GetAtt 
+                  - CodePipelineArtifactBucket
+                  - Arn
+                - /*
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: !Join 
+              - ''
+              - - !GetAtt 
+                  - CodePipelineArtifactBucket
+                  - Arn
+                - /*
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+  
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: codepipeline-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${SourceRepoName}'
+                Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+              - Resource: !GetAtt 'CodeBuildProject.Arn'
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - iam:PassRole #permission is required according to AWS documentation https://docs.aws.amazon.com/codepipeline/latest/userguide/security-iam.html#:~:text=For%20AWS%20CloudFormation%20support
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService:
+                    - cloudformation.amazonaws.com
+              - Resource: !Sub 'arn:aws:s3:::${CodePipelineArtifactBucket}/*'
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+    DependsOn: CodePipelineArtifactBucket
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+              - Resource: !Sub arn:aws:s3:::${CodePipelineArtifactBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+              - Resource: !Sub arn:aws:ecr:us-east-1:754469564153:repository/${EcrDockerRepository}
+                Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo "Logging into Amazon ECR..."
+                - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 754469564153.dkr.ecr.us-east-1.amazonaws.com
+                - TAG="$(date +%Y%m%d%H%M%S)"
+            build:
+              commands:
+                - echo Build started on `date`
+                - docker build -t "${REPOSITORY_URI}:latest" .
+                - docker tag "${REPOSITORY_URI}:latest" "${REPOSITORY_URI}:${TAG}"
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo "Pushing Docker image to ECR"
+                - docker push "${REPOSITORY_URI}:${TAG}"
+                - printf '{"Tag":"%s","RepositoryUri":"%s"}' $TAG $REPOSITORY_URI $PROJECT_NAME $ARTIFACT_BUCKET
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: "aws/codebuild/standard:5.0"
+        PrivilegedMode: True
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: REPOSITORY_URI
+            Value: !Sub 754469564153.dkr.ecr.us-east-1.amazonaws.com/${EcrDockerRepository}
+      Name: !Ref AWS::StackName
+      ServiceRole: !GetAtt 'CodeBuildServiceRole.Arn'
+
+  CodePipelineCodeCommit:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt 'CodePipelineServiceRole.Arn'
+      ArtifactStore:
+        Type: S3
+        Location: !Ref 'CodePipelineArtifactBucket'
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: '1'
+                Provider: CodeCommit
+              Configuration:
+                PollForSourceChanges: 'true'
+                RepositoryName: !Ref SourceRepoName
+                BranchName: !Ref BranchName
+              OutputArtifacts:
+                - Name: App
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: App
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
